@@ -1,0 +1,317 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Feb 26 22:05:08 2026
+
+@author: Oilsmell
+"""
+
+# -*- coding: utf-8 -*-
+"""
+[Step 13] Final Generation & Model Export (Code_9)
+- Optimal Hyperparameters: LAMBDA_MMD = 0.3, RESIDUAL_SCALE = 0.9
+- Action: Save models, Generate dense synthetic data for Structure B (0.0 to 0.5, step 0.02)
+- Output: Save 1D text files and plot the continuous growth of Synthetic DIs.
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import os
+from scipy.stats import kurtosis
+from scipy.signal import welch
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+import pickle
+
+# =========================================================
+# 1. Configuration
+# =========================================================
+class Config:
+    DIR_A = r"E:\Benchmark Code\benchmarktu1402-master\f_accerlerations\ds1"
+    DIR_B = r"E:\2ndstructuredata\raw data"
+    FILE_B = "healthyclean.txt"
+    
+    # [요청 반영] 새로운 저장 폴더 Code_9
+    SAVE_DIR = r"E:\2ndstructuredata\Code_9_Final_Export"
+    
+    WINDOW_SIZE = 128
+    LATENT_DIM = 8
+    SELECTED_NODES = [3, 21, 39, 57, 63, 81, 99, 117]
+    
+    DAMAGE_CASES_A = list(range(1, 11))
+    
+    AE_EPOCHS = 500
+    DON_EPOCHS = 500
+    BATCH_SIZE = 128
+    LR = 0.001
+    
+    # [최적의 파라미터]
+    LAMBDA_MMD = 0.3
+    RESIDUAL_SCALE = 0.9 
+    
+    # [요청 반영] 0.0부터 0.5까지 0.02 간격 배열 생성 (총 26개 스텝)
+    SYNTHETIC_DI_STEPS = np.arange(0.0, 0.51, 0.02) 
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+cfg = Config()
+if not os.path.exists(cfg.SAVE_DIR): os.makedirs(cfg.SAVE_DIR)
+
+# =========================================================
+# 2. Models & MMD
+# =========================================================
+def rbf_kernel(x, y, gamma=1.0):
+    x = x.unsqueeze(1)
+    y = y.unsqueeze(0)
+    return torch.exp(-gamma * torch.sum((x - y) ** 2, dim=2))
+
+def mmd_loss(x, y, gamma=1.0):
+    xx = rbf_kernel(x, x, gamma)
+    yy = rbf_kernel(y, y, gamma)
+    xy = rbf_kernel(x, y, gamma)
+    return xx.mean() + yy.mean() - 2 * xy.mean()
+
+class Autoencoder(nn.Module):
+    def __init__(self, input_dim=128*8, latent_dim=8):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 512), nn.SiLU(),
+            nn.Linear(512, 256), nn.SiLU(),
+            nn.Linear(256, 64), nn.SiLU(),
+            nn.Linear(64, latent_dim)
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 64), nn.SiLU(),
+            nn.Linear(64, 256), nn.SiLU(),
+            nn.Linear(256, 512), nn.SiLU(),
+            nn.Linear(512, input_dim)
+        )
+    def forward(self, x):
+        z = self.encoder(x)
+        return self.decoder(z), z
+
+class FourierFeature(nn.Module):
+    def __init__(self, input_dim, mapping_size=128, scale=10):
+        super().__init__()
+        self.register_buffer('B', torch.randn(input_dim, mapping_size) * scale)
+    def forward(self, x):
+        projected = 2 * np.pi * (x @ self.B)
+        return torch.cat([torch.sin(projected), torch.cos(projected)], dim=-1)
+
+class DeepONet(nn.Module):
+    def __init__(self, branch_dim=9, trunk_dim=2, hidden_dim=128):
+        super().__init__()
+        self.branch = nn.Sequential(
+            nn.Linear(branch_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.fourier = FourierFeature(trunk_dim)
+        self.trunk = nn.Sequential(
+            nn.Linear(256, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.bias = nn.Parameter(torch.zeros(1))
+    def forward(self, branch_in, trunk_in):
+        B = self.branch(branch_in)
+        T = self.trunk(self.fourier(trunk_in))
+        return torch.matmul(B, T.T) + self.bias
+
+# =========================================================
+# 3. Utility Functions
+# =========================================================
+def load_data(path, is_A=False):
+    try:
+        if is_A:
+            data = np.loadtxt(path)
+            data = data[:, cfg.SELECTED_NODES].T if data.shape[0] > data.shape[1] else data[cfg.SELECTED_NODES, :]
+        else:
+            raw = [float(line.split()[1]) for line in open(path, 'r') if len(line.split()) >= 2]
+            data = np.array(raw, dtype=np.float32).reshape(8, -1)
+        n_samples = data.shape[1] // cfg.WINDOW_SIZE
+        return data[:, :n_samples * cfg.WINDOW_SIZE].astype(np.float32)
+    except Exception as e:
+        print(f"Error loading {path}: {e}")
+        return None
+
+def calc_di(healthy, damaged):
+    window = 2000
+    n_wins = min(healthy.shape[1], damaged.shape[1]) // window
+    if n_wins < 1: n_wins = 1; window = min(healthy.shape[1], damaged.shape[1])
+    di_list = [abs(np.percentile(kurtosis(healthy[i, :n_wins*window].reshape(n_wins, window), axis=1, fisher=False), 95) - 
+                   np.percentile(kurtosis(damaged[i, :n_wins*window].reshape(n_wins, window), axis=1, fisher=False), 95)) 
+               for i in range(8)]
+    return np.mean(di_list)
+
+def reshape_for_scaler(data):
+    ns = data.shape[1] // cfg.WINDOW_SIZE
+    return data.reshape(8, ns, cfg.WINDOW_SIZE).transpose(1, 0, 2).reshape(ns, -1), ns
+
+# =========================================================
+# 4. Pipeline Execution
+# =========================================================
+def main():
+    print("=== Phase 1: Healthy-based Normalization ===")
+    raw_h_A = load_data(os.path.join(cfg.DIR_A, "fh_accelerations.dat"), is_A=True)
+    raw_h_B = load_data(os.path.join(cfg.DIR_B, cfg.FILE_B), is_A=False)
+    
+    reshaped_h_A, ns_A = reshape_for_scaler(raw_h_A)
+    reshaped_h_B, ns_B = reshape_for_scaler(raw_h_B)
+    
+    scaler_A = MinMaxScaler(feature_range=(0, 1)).fit(reshaped_h_A)
+    scaler_B = MinMaxScaler(feature_range=(0, 1)).fit(reshaped_h_B)
+    
+    # 모델 재사용을 위한 스케일러 저장
+    with open(os.path.join(cfg.SAVE_DIR, "scaler_A.pkl"), 'wb') as f: pickle.dump(scaler_A, f)
+    with open(os.path.join(cfg.SAVE_DIR, "scaler_B.pkl"), 'wb') as f: pickle.dump(scaler_B, f)
+    
+    norm_h_A = scaler_A.transform(reshaped_h_A)
+    norm_h_B = scaler_B.transform(reshaped_h_B)
+    
+    print(f"\n=== Phase 2: Autoencoder Training (MMD={cfg.LAMBDA_MMD}) ===")
+    ae = Autoencoder().to(cfg.device)
+    optimizer_ae = optim.Adam(ae.parameters(), lr=cfg.LR)
+    criterion_recon = nn.MSELoss()
+    
+    loader_A = DataLoader(TensorDataset(torch.FloatTensor(norm_h_A)), batch_size=cfg.BATCH_SIZE, shuffle=True, drop_last=True)
+    loader_B = DataLoader(TensorDataset(torch.FloatTensor(norm_h_B)), batch_size=cfg.BATCH_SIZE, shuffle=True, drop_last=True)
+    
+    for epoch in range(cfg.AE_EPOCHS):
+        ae.train()
+        total_recon, total_mmd = 0, 0
+        for (batch_A,), (batch_B,) in zip(loader_A, loader_B):
+            b_A, b_B = batch_A.to(cfg.device), batch_B.to(cfg.device)
+            optimizer_ae.zero_grad()
+            
+            recon_A, z_A_batch = ae(b_A)
+            recon_B, z_B_batch = ae(b_B)
+            
+            loss_r = criterion_recon(recon_A, b_A) + criterion_recon(recon_B, b_B)
+            loss_m = mmd_loss(z_A_batch, z_B_batch)
+            
+            loss = loss_r + (cfg.LAMBDA_MMD * loss_m)
+            loss.backward()
+            optimizer_ae.step()
+            total_recon += loss_r.item()
+            total_mmd += loss_m.item()
+            
+        if (epoch+1) % 50 == 0: 
+            print(f"   AE Epoch {epoch+1}/{cfg.AE_EPOCHS} | Recon Loss: {total_recon/len(loader_A):.6f}")
+    
+    # 인코더 저장
+    torch.save(ae.state_dict(), os.path.join(cfg.SAVE_DIR, "autoencoder_best.pth"))
+    
+    ae.eval()
+    with torch.no_grad():
+        z_A = ae.encoder(torch.FloatTensor(norm_h_A).to(cfg.device)).cpu().numpy()
+        z_B = ae.encoder(torch.FloatTensor(norm_h_B).to(cfg.device)).cpu().numpy()
+
+    print(f"\n=== Phase 3: DeepONet Residual Training (Residual Scale={cfg.RESIDUAL_SCALE}) ===")
+    dis_A_raw = [calc_di(raw_h_A, load_data(os.path.join(cfg.DIR_A, f"f{c}_accelerations.dat"), is_A=True)) for c in cfg.DAMAGE_CASES_A]
+    min_di_A, max_di_A = min(dis_A_raw), max(dis_A_raw)
+    
+    X_branch, Y_target = [], []
+    for i, c in enumerate(cfg.DAMAGE_CASES_A):
+        raw_d = load_data(os.path.join(cfg.DIR_A, f"f{c}_accelerations.dat"), is_A=True)
+        reshaped_d, _ = reshape_for_scaler(raw_d)
+        norm_d = scaler_A.transform(reshaped_d)
+        
+        target_res = (norm_d - norm_h_A) * cfg.RESIDUAL_SCALE 
+        di_norm = (dis_A_raw[i] - min_di_A) / (max_di_A - min_di_A)
+        
+        b_in = np.hstack([z_A, np.full((ns_A, 1), di_norm)])
+        X_branch.append(b_in)
+        Y_target.append(target_res)
+        
+    X_branch = np.vstack(X_branch)
+    Y_target = np.vstack(Y_target)
+    
+    don = DeepONet(branch_dim=9, trunk_dim=2).to(cfg.device)
+    optimizer_don = optim.Adam(don.parameters(), lr=cfg.LR)
+    scheduler = optim.lr_scheduler.StepLR(optimizer_don, step_size=300, gamma=0.5) 
+    
+    T_grid, X_grid = np.meshgrid(np.linspace(0, 1, cfg.WINDOW_SIZE), np.linspace(0, 1, 8))
+    trunk_in = torch.FloatTensor(np.stack([T_grid.flatten(), X_grid.flatten()], axis=1)).to(cfg.device)
+    loader_don = DataLoader(TensorDataset(torch.FloatTensor(X_branch), torch.FloatTensor(Y_target)), batch_size=cfg.BATCH_SIZE, shuffle=True)
+    
+    for epoch in range(cfg.DON_EPOCHS):
+        don.train()
+        total_loss = 0
+        for b_in, target in loader_don:
+            optimizer_don.zero_grad()
+            preds = don(b_in.to(cfg.device), trunk_in)
+            loss = nn.MSELoss()(preds, target.to(cfg.device))
+            loss.backward()
+            optimizer_don.step()
+            total_loss += loss.item()
+        scheduler.step()
+        if (epoch+1) % 100 == 0: 
+            print(f"   DeepONet Epoch {epoch+1}/{cfg.DON_EPOCHS} | Loss: {total_loss/len(loader_don):.6f}")
+            
+    # DeepONet 저장
+    torch.save(don.state_dict(), os.path.join(cfg.SAVE_DIR, "deeponet_best.pth"))
+
+    print("\n=== Phase 4: Generate DENSE Synthetic Data for Structure B ===")
+    print(f"Generating DIs from 0.0 to 0.5 (step 0.02)...")
+    
+    don.eval()
+    gen_dis_B_dense = []
+    
+    synth_dir = os.path.join(cfg.SAVE_DIR, "Synthetic_B_Data")
+    if not os.path.exists(synth_dir): os.makedirs(synth_dir)
+    
+    for di_norm in cfg.SYNTHETIC_DI_STEPS:
+        b_in = torch.FloatTensor(np.hstack([z_B, np.full((len(norm_h_B), 1), di_norm)])).to(cfg.device)
+        
+        with torch.no_grad():
+            pred_res = don(b_in, trunk_in).cpu().numpy() / cfg.RESIDUAL_SCALE
+            
+        gen_phys = scaler_B.inverse_transform(norm_h_B + pred_res)
+        gen_data = gen_phys.reshape(len(norm_h_B), 8, cfg.WINDOW_SIZE).transpose(1, 0, 2).reshape(8, -1)
+        
+        gen_di = calc_di(raw_h_B, gen_data)
+        gen_dis_B_dense.append(gen_di)
+        print(f"Input DI: {di_norm:<4.2f} | Generated Real DI: {gen_di:.6f}")
+        
+        # 텍스트 파일 저장 (GAN 훈련용)
+        file_name = f"Synthetic_B_DI_{di_norm:.2f}.txt"
+        save_path = os.path.join(synth_dir, file_name)
+        np.savetxt(save_path, gen_data.T, fmt='%.6e', delimiter='\t')
+
+    print(f"\n✅ All {len(cfg.SYNTHETIC_DI_STEPS)} synthetic data files saved in: {synth_dir}")
+
+    # [요청 반영] 시각적으로 얼만큼 증가했는지 보여주는 직관적인 그래프 추가
+    plt.figure(figsize=(10, 6))
+    
+    # DI 증가 추이 선 그래프
+    plt.plot(cfg.SYNTHETIC_DI_STEPS, gen_dis_B_dense, 'b-o', linewidth=2, markersize=6, label='Synthetic DI Growth')
+    
+    # 건강 상태(DI=0) 기준선 추가
+    base_di = gen_dis_B_dense[0]
+    plt.axhline(y=base_di, color='green', linestyle='--', alpha=0.7, label=f'Healthy Baseline (DI={base_di:.6f})')
+    
+    # 시작점과 끝점 수치 텍스트 표시
+    plt.annotate(f'Start: {base_di:.6f}', 
+                 xy=(0.0, base_di), xytext=(0.02, base_di + (gen_dis_B_dense[-1] - base_di)*0.1),
+                 arrowprops=dict(facecolor='black', shrink=0.05, width=1, headwidth=5))
+    
+    plt.annotate(f'End: {gen_dis_B_dense[-1]:.6f}', 
+                 xy=(0.5, gen_dis_B_dense[-1]), xytext=(0.4, gen_dis_B_dense[-1] - (gen_dis_B_dense[-1] - base_di)*0.1),
+                 arrowprops=dict(facecolor='red', shrink=0.05, width=1, headwidth=5))
+
+    plt.title("Structure B: Synthetic Damage Index Growth Map (0.0 ~ 0.5)", fontsize=14, fontweight='bold')
+    plt.xlabel("Input Damage Factor (0.02 steps)", fontsize=12)
+    plt.ylabel("Generated Kurtosis Damage Index", fontsize=12)
+    plt.xticks(np.arange(0.0, 0.52, 0.04))
+    plt.legend(loc='upper left', fontsize=11)
+    plt.grid(True, linestyle=':', alpha=0.6)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(cfg.SAVE_DIR, "synthetic_B_growth_map.png"), dpi=300)
+    plt.show()
+
+if __name__ == "__main__":
+    main()
